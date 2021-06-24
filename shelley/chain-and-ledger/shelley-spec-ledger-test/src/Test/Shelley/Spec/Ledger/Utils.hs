@@ -134,6 +134,7 @@ import Shelley.Spec.Ledger.PParams (PParamsUpdate)
 import Shelley.Spec.Ledger.Tx (Tx, TxOut, WitnessSet)
 import Test.QuickCheck (Arbitrary (..))
 import Test.Shelley.Spec.Ledger.ConcreteCryptoTypes (Mock)
+import Test.QuickCheck (Arbitrary (..))
 import Test.Tasty.HUnit
   ( Assertion,
     (@?=),
