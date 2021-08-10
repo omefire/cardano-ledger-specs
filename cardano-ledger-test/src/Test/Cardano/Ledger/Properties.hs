@@ -67,18 +67,6 @@ import Shelley.Spec.Ledger.STS.Utxo (UtxoEnv (..))
 import Shelley.Spec.Ledger.UTxO (balance, makeWitnessVKey)
 import Test.Cardano.Ledger.Alonzo.Serialisation.Generators ()
 import Test.QuickCheck
-  ( Property,
-    choose,
-    chooseInt,
-    conjoin,
-    counterexample,
-    elements,
-    oneof,
-    property,
-    vectorOf,
-    (===),
-    (==>),
-  )
 import Test.Shelley.Spec.Ledger.ConcreteCryptoTypes (C_Crypto)
 import Test.Shelley.Spec.Ledger.Serialisation.EraIndepGenerators ()
 import Test.Shelley.Spec.Ledger.Utils
@@ -89,6 +77,7 @@ import Test.Shelley.Spec.Ledger.Utils
   )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.QuickCheck (Arbitrary (..), Gen, forAll, testProperty)
+
 
 type A = AlonzoEra C_Crypto
 
@@ -110,12 +99,18 @@ data BagOSecrets = BagOSecrets
     datums :: Vault (DataHash C_Crypto) (Data A)
   }
 
+data TestState =
+  TestState
+    { tsKeys :: Map (KeyHash 'Witness C_Crypto) (KeyPair 'Witness C_Crypto)
+    , tsDatums :: Map (DataHash C_Crypto) (Data A)
+    }
+
 findKey :: KeySpace -> KeyHash 'Witness C_Crypto -> KeyPair 'Witness C_Crypto
 findKey (KeySpace ks) target = snd . head $ filter (\(kh, _) -> kh == target) ks
 
 instance Arbitrary KeySpace where
   arbitrary = do
-    kps <- genListBetween 10 1000 (mkKeyPair' <$> arbitrary)
+    kps <- genListBetween 10 1000 arbitrary
     pure $ KeySpace [(hashKey $ vKey kp, kp) | kp <- kps]
 
 genPaymentKeyCred ::
@@ -148,9 +143,9 @@ genOut ks = do
 
 genUTxO :: Set (Data A) -> KeySpace -> Gen (UTxO A)
 genUTxO _ds ks = do
-  NotTooSmallInputSet ins <- arbitrary
+  NonEmpty ins <- resize 100 arbitrary
   UTxO . Map.fromList
-    <$> mapM (\i -> fmap (i,) (genOut ks)) (Set.toList ins)
+    <$> mapM (\i -> fmap (i,) (genOut ks)) (Set.toList (Set.fromList ins))
 
 genUTxOState :: UTxO A -> Gen (UTxOState A)
 genUTxOState utxo = UTxOState utxo <$> arbitrary <*> arbitrary <*> pure def
