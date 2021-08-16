@@ -111,8 +111,6 @@ type A = AlonzoEra C_Crypto
 --     datums :: Vault (DataHash C_Crypto) (Data A)
 --   }
 
-
-
 -- newtype NotTooSmallInputSet = NotTooSmallInputSet (Set (TxIn C_Crypto))
 --   deriving (Show)
 
@@ -139,12 +137,9 @@ elementsT gens = do
   i <- lift $ choose (0, length gens - 1)
   gens !! i
 
-
-
-newtype GenEnv =
-  GenEnv
-    { geValidityInterval :: ValidityInterval
-    }
+newtype GenEnv = GenEnv
+  { geValidityInterval :: ValidityInterval
+  }
 
 data GenState = GenState
   { gsKeys :: Map (KeyHash 'Witness C_Crypto) (KeyPair 'Witness C_Crypto),
@@ -185,12 +180,12 @@ getTxOutWitness bodyHash (TxOut addr _ mdh) = do
                 }
           mkWitVKey (ScriptHashObj scriptHash) =
             let script = getByHash "script" scriptHash gsScripts
+                scriptWit = mempty {txscripts = Map.singleton scriptHash script}
              in case script of
                   TimelockScript timelock -> do
-                    tw <- mkTimelockWit timelock
-                    pure $
-                      tw <> mempty {txscripts = Map.singleton scriptHash script}
-                  PlutusScript _ -> error "Unimplemented"
+                    timelockWit <- mkTimelockWit timelock
+                    pure $ timelockWit <> scriptWit
+                  PlutusScript _ps -> pure scriptWit
           mkTimelockWit =
             \case
               RequireSignature keyHash -> mkWitVKey (KeyHashObj keyHash)
@@ -235,15 +230,15 @@ genTimelock = do
   let genNestedTimelock k
         | k > 0 =
           elementsT $
-          nonReqTimelocks ++ [requireAllOf k, requireAnyOf k, requireMOf k]
-        | otherwise = elementsT nonReqTimelocks
-      nonReqTimelocks =
+            nonRecTimelocks ++ [requireAllOf k, requireAnyOf k, requireMOf k]
+        | otherwise = elementsT nonRecTimelocks
+      nonRecTimelocks =
         [ r
-        | SJust r <-
-            [ SJust requireSignature
-            -- , requireTimeStart <$> mBefore
-            , requireTimeExpire <$> mAfter
-            ]
+          | SJust r <-
+              [ SJust requireSignature,
+                requireTimeStart <$> mBefore,
+                requireTimeExpire <$> mAfter
+              ]
         ]
       requireSignature = RequireSignature <$> genCredential
       requireAllOf k = do
@@ -265,11 +260,16 @@ genTimelock = do
   genNestedTimelock (2 :: Natural)
 
 genScript :: GenRS (ScriptHash C_Crypto)
-genScript = do
-  script <- TimelockScript <$> genTimelock
-  let scriptHash = hashScript @A script
-  modify $ \ts@GenState {gsScripts} -> ts {gsScripts = Map.insert scriptHash script gsScripts}
-  pure scriptHash
+genScript =
+  elementsT
+    [ genScriptHash . TimelockScript =<< genTimelock,
+      genScriptHash . alwaysSucceeds =<< lift arbitrary
+    ]
+  where
+    genScriptHash script = do
+      let scriptHash = hashScript @A script
+      modify $ \ts@GenState {gsScripts} -> ts {gsScripts = Map.insert scriptHash script gsScripts}
+      pure scriptHash
 
 genPaymentCredential :: GenRS (Credential 'Payment C_Crypto)
 genPaymentCredential =
@@ -348,7 +348,7 @@ genValidatedTx utxo = do
   (txIns, txOuts) <- unzip . take n <$> lift (shuffle $ Map.toList $ unUTxO utxo)
   recipients <- genRecipientsFrom txOuts
   nid <- lift $ elements [SNothing, SJust Testnet]
-  GenEnv{geValidityInterval} <- ask
+  GenEnv {geValidityInterval} <- ask
   let txBody =
         TxBody
           (Set.fromList txIns)
