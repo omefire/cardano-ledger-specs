@@ -328,6 +328,23 @@ genUTxO = do
   where
     genOut = genTxOut . inject . Coin . getNonNegative =<< lift arbitrary
 
+genCollateralUTxO :: Coin -> UTxO A -> GenRS (UTxO A, Map.Map (TxIn C_Crypto) (TxOut A))
+genCollateralUTxO (Coin fee) (UTxO utxoMap) = do
+  GenEnv {gePParams} <- ask
+  let collPerc = _collateralPercentage gePParams
+      collTotal = Coin (ceiling ((fee * toInteger collPerc) % 100))
+  cred <- coerceKeyRole . KeyHashObj <$> genCredential
+  stakeCred <- StakeRefBase <$> genStakingCredential
+  let collTxOut =
+        TxOut (Addr Testnet cred stakeCred) (inject collTotal) SNothing
+      genCollTxIn = do
+        txIn <- arbitrary
+        if Map.member txIn utxoMap
+          then genCollTxIn
+          else pure txIn
+  collTxIn <- lift genCollTxIn
+  pure (UTxO (Map.insert collTxIn collTxOut utxoMap), Map.singleton collTxIn collTxOut)
+
 genUTxOState :: UTxO A -> GenRS (UTxOState A)
 genUTxOState utxo =
   lift (UTxOState utxo <$> arbitrary <*> arbitrary <*> pure def)
@@ -363,21 +380,24 @@ genRecipientsFrom txOuts = do
 
 genValidatedTx :: GenRS (UTxO A, ValidatedTx A)
 genValidatedTx = do
-  utxo <- genUTxO
-  n <- lift $ choose (1, length (unUTxO utxo))
-  toSpend <- Map.fromList . take n <$> lift (shuffle $ Map.toList $ unUTxO utxo)
-  recipients <- genRecipientsFrom $ Map.elems toSpend
+  utxo' <- genUTxO
+  let fee = Coin 0
+  n <- lift $ choose (1, length (unUTxO utxo'))
+  toSpend' <- Map.fromList . take n <$> lift (shuffle $ Map.toList $ unUTxO utxo')
+  (utxo, collMap) <- genCollateralUTxO fee utxo'
+  let toSpend = Map.union collMap toSpend'
+  recipients <- genRecipientsFrom $ Map.elems toSpend'
   nid <- lift $ elements [SNothing, SJust Testnet]
   GenEnv {geValidityInterval} <- ask
   let txIns = Map.keysSet toSpend
       txBody =
         TxBody
           { inputs = txIns,
-            collateral = mempty,
+            collateral = Map.keysSet collMap,
             outputs = Seq.fromList recipients,
             txcerts = mempty,
             txwdrls = Wdrl mempty,
-            txfee = Coin 0,
+            txfee = fee,
             txvldt = geValidityInterval,
             txUpdates = SNothing,
             reqSignerHashes = mempty,
