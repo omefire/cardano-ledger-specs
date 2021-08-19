@@ -58,6 +58,7 @@ library
     data-default-class,
     genvalidity,
     genvalidity-scientific,
+    mtl,
     plutus-ledger-api,
     scientific,
     shelley-spec-ledger,
