@@ -9,16 +9,6 @@
 
 module Test.Cardano.Ledger.Properties where
 
---import Debug.Trace (trace)
-
---import Cardano.Ledger.Mary.Value (Value (..))
-
---ScriptPurpose (..),
-
---hashWitnessPPData,
-
---Positive (..),
-
 import Cardano.Ledger.Alonzo (AlonzoEra, Value)
 import Cardano.Ledger.Alonzo.Data (Data, DataHash, hashData)
 import Cardano.Ledger.Alonzo.Language (Language (..))
@@ -35,7 +25,7 @@ import Cardano.Ledger.Alonzo.TxBody (TxBody (..), TxOut (..))
 import Cardano.Ledger.Alonzo.TxWitness (RdmrPtr (..), Redeemers (..), TxDats (..), TxWitness (..))
 import Cardano.Ledger.BaseTypes (Network (Testnet), StrictMaybe (..))
 import Cardano.Ledger.Coin (Coin (..))
-import Cardano.Ledger.Hashes (ScriptHash (..))
+import Cardano.Ledger.Hashes (EraIndependentTxBody, ScriptHash (..))
 import Cardano.Ledger.Keys
   ( GenDelegs (..),
     KeyHash (..),
@@ -44,11 +34,11 @@ import Cardano.Ledger.Keys
     coerceKeyRole,
     hashKey,
   )
-import Cardano.Ledger.SafeHash (hashAnnotated)
+import Cardano.Ledger.SafeHash (SafeHash, hashAnnotated)
 import Cardano.Ledger.ShelleyMA.Timelocks (Timelock (..), ValidityInterval (..))
 import Cardano.Ledger.Val
 import Cardano.Slotting.Slot (SlotNo (..))
-import Control.Monad (replicateM)
+import Control.Monad (forM, join, replicateM)
 import Control.Monad.State.Strict (MonadState (..), modify)
 import Control.Monad.Trans.Class (MonadTrans (lift))
 import Control.Monad.Trans.RWS.Strict (RWST (..), ask, evalRWST)
@@ -62,11 +52,11 @@ import Data.Monoid (All (..))
 import Data.Ratio ((%))
 import qualified Data.Sequence.Strict as Seq
 import qualified Data.Set as Set
+import GHC.Stack
 import Numeric.Natural
 import Plutus.V1.Ledger.Api (defaultCostModelParams)
 import Shelley.Spec.Ledger.API
   ( Addr (..),
-    CLI (evaluateTransactionFee),
     Credential (..),
     StakeReference (..),
     TxIn (..),
@@ -88,10 +78,7 @@ import Test.Tasty.QuickCheck (testProperty)
 type A = AlonzoEra C_Crypto
 
 elementsT :: (Monad (t Gen), MonadTrans t) => [t Gen b] -> t Gen b
-elementsT [] = error "Need at least one generator"
-elementsT gens = do
-  i <- lift $ choose (0, length gens - 1)
-  gens !! i
+elementsT = join . lift . elements
 
 getByHashM ::
   (MonadState s m, Ord k, Show k) => String -> k -> (s -> Map.Map k v) -> m v
@@ -139,17 +126,18 @@ genTxPlutusWitness txIx datumHash = do
   redeemerWit <- mkRedeemerWit
   pure $ datumWit <> redeemerWit
 
-genTxWitness :: TxBody A -> TxOut A -> GenRS (TxWitness A)
-genTxWitness txBody (TxOut addr _ _) = do
-  let bodyHash = hashAnnotated txBody
+genTxWitness :: TxOut A -> GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
+genTxWitness (TxOut addr _ _) = do
   case addr of
     AddrBootstrap baddr ->
       error $ "Can't authorize bootstarp address: " ++ show baddr
     Addr _ payCred stakeCred -> do
-      let mkWitVKey :: Credential kr C_Crypto -> GenRS (TxWitness A)
+      let mkWitVKey ::
+            Credential kr C_Crypto ->
+            GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
           mkWitVKey (KeyHashObj keyHash) = do
             cred <- getByHashM "credential" (coerceKeyRole keyHash) gsKeys
-            pure $
+            pure $ \bodyHash ->
               mempty
                 { txwitsVKey = Set.singleton $ makeWitnessVKey bodyHash cred
                 }
@@ -159,15 +147,16 @@ genTxWitness txBody (TxOut addr _ _) = do
             case script of
               TimelockScript timelock -> do
                 timelockWit <- mkTimelockWit timelock
-                pure $ timelockWit <> scriptWit
-              PlutusScript _ps -> pure scriptWit
+                pure $ \bodyHash -> timelockWit bodyHash <> scriptWit
+              PlutusScript _ps -> pure $ const scriptWit
           mkTimelockWit =
             \case
               RequireSignature keyHash -> mkWitVKey (KeyHashObj keyHash)
               RequireAllOf timelocks -> F.fold <$> mapM mkTimelockWit timelocks
               RequireAnyOf timelocks
                 | F.null timelocks -> pure mempty
-                | otherwise -> mkTimelockWit =<< lift (elements (F.toList timelocks))
+                | otherwise ->
+                  mkTimelockWit =<< lift (elements (F.toList timelocks))
               RequireMOf m timelocks -> do
                 ts <- take m <$> lift (shuffle (F.toList timelocks))
                 F.fold <$> mapM mkTimelockWit ts
@@ -178,18 +167,6 @@ genTxWitness txBody (TxOut addr _ _) = do
       witVKey <- mkWitVKey payCred
       stakeWitVKey <- mkStakeWit stakeCred
       pure $ witVKey <> stakeWitVKey
-
--- where
---   getByHash :: (Ord k, Show k) => String -> k -> Map.Map k v -> v
---   getByHash name k m =
---     case Map.lookup k m of
---       Nothing ->
---         error $
---           "Impossible: Can't find "
---             ++ name
---             ++ " in the test enviroment: "
---             ++ show k
---       Just val -> val
 
 genCredential :: GenRS (KeyHash 'Witness C_Crypto)
 genCredential = do
@@ -254,10 +231,10 @@ genScript =
       modify $ \ts@GenState {gsScripts} -> ts {gsScripts = Map.insert scriptHash s gsScripts}
       pure scriptHash
 
-hasValidScript :: MonadState GenState m => Addr C_Crypto -> m (StrictMaybe IsValid)
-hasValidScript (Addr _ (ScriptHashObj scriptHash) _) =
+getScriptValidity :: MonadState GenState m => Addr C_Crypto -> m (StrictMaybe IsValid)
+getScriptValidity (Addr _ (ScriptHashObj scriptHash) _) =
   fst <$> getByHashM "script" scriptHash gsScripts
-hasValidScript _ = pure SNothing
+getScriptValidity _ = pure SNothing
 
 genPaymentCredential :: GenRS (Credential 'Payment C_Crypto)
 genPaymentCredential =
@@ -269,11 +246,13 @@ genPaymentCredential =
 genStakingCredential :: GenRS (Credential 'Staking C_Crypto)
 genStakingCredential = coerceKeyRole . KeyHashObj <$> genCredential
 
-genRecipient :: GenRS (Addr C_Crypto)
-genRecipient = do
-  paymentCred <- genPaymentCredential
+genRecipientWithPayment :: Credential 'Payment C_Crypto -> GenRS (Addr C_Crypto)
+genRecipientWithPayment paymentCred = do
   stakeCred <- StakeRefBase <$> genStakingCredential
   pure (Addr Testnet paymentCred stakeCred)
+
+genRecipient :: GenRS (Addr C_Crypto)
+genRecipient = genPaymentCredential >>= genRecipientWithPayment
 
 genDatumHash :: GenRS (DataHash C_Crypto)
 genDatumHash = fst <$> genDatum
@@ -288,33 +267,61 @@ genDatum = do
 genTxOut :: Value A -> GenRS (TxOut A)
 genTxOut val = do
   addr <- genRecipient
-  mIsValid <- hasValidScript addr
+  mIsValid <- getScriptValidity addr
   mDatumHash <- mapM (const genDatumHash) mIsValid
   pure $ TxOut addr val mDatumHash
+
+-- | Generate a non-zero value
+genVal :: Val v => Gen v
+genVal = inject . Coin . getPositive <$> arbitrary
 
 genUTxO :: GenRS (UTxO A)
 genUTxO = do
   NonEmpty ins <- lift $ resize 10 arbitrary
-  UTxO <$> sequenceA (Map.fromSet (const genOut) (Set.fromList ins))
+  UTxO <$> sequence (Map.fromSet (const genOut) (Set.fromList ins))
   where
-    genOut = genTxOut . inject . Coin . getNonNegative =<< lift arbitrary
+    genOut = genTxOut =<< lift genVal
 
-genCollateralUTxO :: Coin -> UTxO A -> GenRS (UTxO A, Map.Map (TxIn C_Crypto) (TxOut A))
-genCollateralUTxO (Coin fee) (UTxO utxoMap) = do
+genCollateralUTxO ::
+  HasCallStack =>
+  [Addr C_Crypto] ->
+  Coin ->
+  UTxO A ->
+  GenRS (UTxO A, Map.Map (TxIn C_Crypto) (TxOut A))
+genCollateralUTxO collateralAddresses (Coin fee) (UTxO utxoMap) = do
   GenEnv {gePParams} <- ask
   let collPerc = _collateralPercentage gePParams
-      collTotal = Coin (ceiling ((fee * toInteger collPerc) % 100))
-  cred <- coerceKeyRole . KeyHashObj <$> genCredential
-  stakeCred <- StakeRefBase <$> genStakingCredential
-  let collTxOut =
-        TxOut (Addr Testnet cred stakeCred) (inject collTotal) SNothing
-      genCollTxIn = do
-        txIn <- arbitrary
-        if Map.member txIn utxoMap
-          then genCollTxIn
-          else pure txIn
-  collTxIn <- lift genCollTxIn
-  pure (UTxO (Map.insert collTxIn collTxOut utxoMap), Map.singleton collTxIn collTxOut)
+      minCollTotal = Coin (ceiling ((fee * toInteger collPerc) % 100))
+      -- Generate a collateral that is neither in UTxO map nor has already been generated
+      genNewCollateral addr coll um c = do
+        txIn <- lift arbitrary
+        if Map.member txIn utxoMap || Map.member txIn coll
+          then genNewCollateral addr coll um c
+          else pure (um, Map.insert txIn (TxOut addr (inject c) SNothing) coll, c)
+      -- Either pick a collateral from a map or generate a completely new one
+      genCollateral addr coll um
+        | Map.null um = genNewCollateral addr coll um =<< lift genVal
+        | otherwise = do
+          i <- lift $ chooseInt (0, Map.size um - 1)
+          let (txIn, txOut@(TxOut _ val _)) = Map.elemAt i um
+          pure (Map.deleteAt i um, Map.insert txIn txOut coll, coin val)
+      -- Recursively either pick existing key spend only outputs or generate new ones that
+      -- will be later added to the UTxO map
+      go ecs !coll !curCollTotal !um
+        | curCollTotal >= minCollTotal = pure coll
+        | [] <- ecs = error "Impossible: supplied less addresses then `maxCollateralInputs`"
+        | ec : ecs' <- ecs = do
+          (um', coll', c) <-
+            if null ecs'
+              then genNewCollateral ec coll um (minCollTotal <-> curCollTotal)
+              else elementsT [genCollateral ec coll Map.empty, genCollateral ec coll um]
+          go ecs' coll' (curCollTotal <+> c) um'
+  collaterals <- go collateralAddresses Map.empty (Coin 0) $ Map.filter spendOnly utxoMap
+  pure (UTxO (Map.union utxoMap collaterals), collaterals)
+  where
+    spendOnly (TxOut (Addr _ (ScriptHashObj _) _) _ _) = False
+    spendOnly (TxOut (Addr _ _ (StakeRefBase (ScriptHashObj _))) _ _) = False
+    spendOnly _ = True
 
 genUTxOState :: UTxO A -> GenRS (UTxOState A)
 genUTxOState utxo =
@@ -329,53 +336,68 @@ genRecipientsFrom txOuts = do
       genExtra e
         | e <= 0 || avgExtra == 0 = pure 0
         | otherwise = lift $ chooseInt (0, avgExtra)
-  let goNew _ [] rs = pure rs
-      goNew e (tx : txs) rs = do
+  let goNew _ [] !rs = pure rs
+      goNew e (tx : txs) !rs = do
         leftToAdd <- genExtra e
         goExtra (e - leftToAdd) leftToAdd (inject (Coin 0)) tx txs rs
-      goExtra _ _ s tx [] rs = (++ rs) <$> genWithChange s tx
-      goExtra e 0 s tx txs rs = do
-        r <- genWithChange s tx
-        goNew e txs (r ++ rs)
-      goExtra e n s (TxOut _ v _) (tx : txs) rs =
-        goExtra e (n - 1) (s <+> v) tx txs rs
-      genWithChange s (TxOut addr v d) = do
-        c <- Coin <$> lift (choose (0, unCoin $ coin v))
+      goExtra _ _ s tx [] !rs = genWithChange s tx rs
+      goExtra e 0 s tx txs !rs = goNew e txs =<< genWithChange s tx rs
+      goExtra e n s (TxOut _ v _) (tx : txs) !rs = goExtra e (n - 1) (s <+> v) tx txs rs
+      genWithChange s (TxOut addr v d) rs = do
+        c <- Coin <$> lift (choose (1, unCoin $ coin v))
         r <- genTxOut (s <+> inject c)
         if c < coin v
           then
             let change = TxOut addr (v <-> inject c) d
-             in pure [r, change]
-          else pure [r]
+             in pure (r : change : rs)
+          else pure (r : rs)
   goNew extra txOuts []
 
 genValidatedTx :: GenRS (UTxO A, ValidatedTx A)
 genValidatedTx = do
-  utxoNoCollateral <- genUTxO
-  let fee = Coin 0
-  n <- lift $ choose (1, length (unUTxO utxoNoCollateral))
+  GenEnv {geValidityInterval, gePParams} <- ask
+  UTxO utxoNoCollateral <- genUTxO
+  -- 1. Produce utxos that will be spent
+  n <- lift $ choose (1, length utxoNoCollateral)
   toSpendNoCollateral <-
-    Map.fromList . take n
-      <$> lift (shuffle $ Map.toList $ unUTxO utxoNoCollateral)
-  (utxo, collMap) <- genCollateralUTxO fee utxoNoCollateral
-  let toSpend = Map.union collMap toSpendNoCollateral
-      allValid vs = IsValid $ getAll $ mconcat [All v | SJust (IsValid v) <- vs]
+    Map.fromList . take n <$> lift (shuffle $ Map.toList utxoNoCollateral)
+  -- 2. Check if all Plutus scripts are valid
+  let allValid vs = IsValid $ getAll $ mconcat [All v | SJust (IsValid v) <- vs]
+      toSpendNoCollateralTxOuts = Map.elems toSpendNoCollateral
+      maxCoin = Coin (toInteger (maxBound :: Int)) -- need it for size overestimation
   isValid <-
     allValid
       <$> mapM
-        hasValidScript
-        [addr | TxOut addr _ (SJust _) <- Map.elems toSpendNoCollateral]
-  recipients <- genRecipientsFrom $ Map.elems toSpendNoCollateral
-  nid <- lift $ elements [SNothing, SJust Testnet]
-  GenEnv {geValidityInterval, gePParams} <- ask
+        getScriptValidity
+        [addr | TxOut addr _ (SJust _) <- toSpendNoCollateralTxOuts]
+  -- 3. Generate all recipients and witnesses needed for spending Plutus scripts
+  recipients <- genRecipientsFrom toSpendNoCollateralTxOuts
   redeemerWitsList <-
     sequence
       [ genTxPlutusWitness ix dh
-        | (ix, (_, TxOut _ _ mdh)) <- zip [0 ..] (Map.toAscList toSpend),
+        | (ix, (_, TxOut _ _ mdh)) <-
+            zip [0 ..] (Map.toAscList toSpendNoCollateral),
           SJust dh <- [mdh]
       ]
-  let txIns = Map.keysSet toSpend
-      redeemerWits = mconcat redeemerWitsList
+  keyWitsMakers <- mapM genTxWitness toSpendNoCollateralTxOuts
+  -- 4. Estimate inputs that will be used as collateral
+  maxCollateralCount <-
+    lift $ chooseInt (1, fromIntegral (_maxCollateralInputs gePParams))
+  bogusCollateralTxId <- lift arbitrary
+  let bogusCollateralTxIns =
+        Set.fromList
+          [ TxIn bogusCollateralTxId (fromIntegral i)
+            | i <- [maxBound, maxBound - 1 .. maxBound - maxCollateralCount - 1]
+          ]
+  collateralAddresses <-
+    replicateM maxCollateralCount $
+      genRecipientWithPayment . coerceKeyRole . KeyHashObj =<< genCredential
+  bogusCollateralKeyWitsMakers <-
+    forM collateralAddresses $ \a ->
+      genTxWitness $ TxOut a (inject maxCoin) SNothing
+  networkId <- lift $ elements [SNothing, SJust Testnet]
+  -- 5. Estimate the fee
+  let redeemerWits = mconcat redeemerWitsList
       mIntegrityHash =
         hashScriptIntegrity
           gePParams
@@ -385,31 +407,57 @@ genValidatedTx = do
           )
           (txrdmrs redeemerWits)
           (txdats redeemerWits)
-      txBody =
+      txBodyNoFee =
         TxBody
-          { inputs = txIns,
-            collateral = Map.keysSet collMap,
+          { inputs = Map.keysSet toSpendNoCollateral,
+            collateral = bogusCollateralTxIns,
             outputs = Seq.fromList recipients,
             txcerts = mempty,
             txwdrls = Wdrl mempty,
-            txfee = fee,
+            txfee = maxCoin,
             txvldt = geValidityInterval,
             txUpdates = SNothing,
             reqSignerHashes = mempty,
             mint = mempty,
             scriptIntegrityHash = mIntegrityHash,
             adHash = SNothing,
-            txnetworkid = nid
+            txnetworkid = networkId
           }
-  keyWits <- mapM (genTxWitness txBody) $ Map.elems toSpend
-  pure
-    ( utxo,
-      ValidatedTx txBody (redeemerWits <> mconcat keyWits) isValid SNothing
-    )
+      txBodyNoFeeHash = hashAnnotated txBodyNoFee
+      noFeeWits =
+        redeemerWits
+          <> foldMap
+            ($ txBodyNoFeeHash)
+            (keyWitsMakers ++ bogusCollateralKeyWitsMakers)
+      bogusTxForFeeCalc = ValidatedTx txBodyNoFee noFeeWits isValid SNothing
+      fee = minfee gePParams bogusTxForFeeCalc
+  -- 6. Crank up the amount in one of outputs to account for the fee. Note this is
+  -- a hack that is not possible in a real life, but in the end it does produce
+  -- real life like setup
+  feeKey <- lift $ elements $ Map.keys toSpendNoCollateral
+  let injectFee (TxOut addr val mdh) = TxOut addr (val <+> inject fee) mdh
+      utxoFeeAdjusted =
+        UTxO $ Map.update (Just . injectFee) feeKey utxoNoCollateral
+  -- 7. Generate utxos that will be used as collateral
+  (utxo, collMap) <- genCollateralUTxO collateralAddresses fee utxoFeeAdjusted
+  collateralKeyWitsMakers <- mapM genTxWitness $ Map.elems collMap
+  -- 8. Construct the correct Tx with valid fee and collaterals
+  let txBody = txBodyNoFee {txfee = fee, collateral = Map.keysSet collMap}
+      txBodyHash = hashAnnotated txBody
+      wits =
+        redeemerWits
+          <> foldMap ($ txBodyHash) (keyWitsMakers ++ collateralKeyWitsMakers)
+      validTx = ValidatedTx txBody wits isValid SNothing
+  pure (utxo, validTx)
 
 genTxAndUTXOState :: Gen (TRC (AlonzoUTXOW A))
 genTxAndUTXOState = do
   maxTxExUnits <- arbitrary
+  maxBlockExUnits <- arbitrary
+  Positive maxCollateralInputs <- arbitrary
+  collateralPercentage <- fromIntegral <$> chooseInt (100, 10000)
+  minfeeA <- fromIntegral <$> chooseInt (100, 1000)
+  minfeeB <- fromIntegral <$> chooseInt (100, 10000)
   let genT = do
         (utxo, tx) <- genValidatedTx
         utxoState <- genUTxOState utxo
@@ -417,11 +465,15 @@ genTxAndUTXOState = do
       pp :: PParams A
       pp =
         def
-          { _costmdls = Map.singleton PlutusV1 $ CostModel $ 0 <$ fromJust defaultCostModelParams,
+          { _minfeeA = minfeeA,
+            _minfeeB = minfeeB,
+            _costmdls = Map.singleton PlutusV1 $ CostModel $ 0 <$ fromJust defaultCostModelParams,
             _maxValSize = 1000,
             _maxTxSize = fromIntegral (maxBound :: Int),
             _maxTxExUnits = maxTxExUnits,
-            _collateralPercentage = 0
+            _maxBlockExUnits = maxBlockExUnits,
+            _collateralPercentage = collateralPercentage,
+            _maxCollateralInputs = maxCollateralInputs
           }
       slotNo = SlotNo 100000000
       utxoEnv = UtxoEnv slotNo pp mempty (GenDelegs mempty)
@@ -440,14 +492,7 @@ totalAda (UTxOState utxo f d _) = f <> d <> coin (balance utxo)
 testTxValidForUTXOW :: TRC (AlonzoUTXOW A) -> Property
 testTxValidForUTXOW trc@(TRC (UtxoEnv _ pp _ _, utxoState, vtx)) =
   case runShelleyBase $ applySTSTest trc of
-    Right utxoState' ->
-      conjoin
-        [ totalAda utxoState' === totalAda utxoState,
-          minfee pp vtx === evaluateTransactionFee pp vtx 0,
-          let vtxNoWits = vtx {wits = mempty}
-              vtxCount = fromIntegral (length (txwitsVKey (wits vtx)))
-           in minfee pp vtx === evaluateTransactionFee pp vtxNoWits vtxCount
-        ]
+    Right utxoState' -> totalAda utxoState' === totalAda utxoState
     Left e -> counterexample (show e) (property False)
 
 testValidTxForUTXOW :: Property
