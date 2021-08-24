@@ -38,7 +38,7 @@ import Cardano.Ledger.SafeHash (SafeHash, hashAnnotated)
 import Cardano.Ledger.ShelleyMA.Timelocks (Timelock (..), ValidityInterval (..))
 import Cardano.Ledger.Val
 import Cardano.Slotting.Slot (SlotNo (..))
-import Control.Monad (forM, join, replicateM)
+import Control.Monad (forM, join, replicateM, zipWithM)
 import Control.Monad.State.Strict (MonadState (..), modify)
 import Control.Monad.Trans.Class (MonadTrans (lift))
 import Control.Monad.Trans.RWS.Strict (RWST (..), ask, evalRWST)
@@ -113,24 +113,41 @@ instance Monoid GenState where
 
 type GenRS = RWST GenEnv () GenState Gen
 
-genTxPlutusWitness :: Int -> DataHash C_Crypto -> GenRS (TxWitness A)
-genTxPlutusWitness txIx datumHash = do
+-- | Generate a list of specified length with randomish `ExUnit`s where the sum
+-- of all values produced will not exceed the maxTxExUnits.
+genExUnits :: Int -> GenRS [ExUnits]
+genExUnits n = do
+  GenEnv {gePParams} <- ask
+  let ExUnits maxMemUnits maxStepUnits = _maxTxExUnits gePParams
+  memUnits <- lift $ genSequenceSum maxMemUnits
+  stepUnits <- lift $ genSequenceSum maxStepUnits
+  pure $ zipWith ExUnits memUnits stepUnits
+  where
+    un = fromIntegral n
+    genUpTo maxVal (!totalLeft, !acc) _
+      | totalLeft == 0 = pure (0, 0 : acc)
+      | otherwise = do
+        x <- min totalLeft . round . (% un) <$> choose (0, maxVal)
+        pure (totalLeft - x, x : acc)
+    genSequenceSum maxVal
+      | maxVal == 0 = pure $ replicate n 0
+      | otherwise = snd <$> F.foldlM (genUpTo maxVal) (maxVal, []) [1 .. n]
+
+genTxPlutusWitness :: Int -> DataHash C_Crypto -> ExUnits -> GenRS (TxWitness A)
+genTxPlutusWitness txIx datumHash exUnits = do
   datum <- getByHashM "datum" datumHash gsDatums
-  let datumWit = mempty {txdats = TxDats $ Map.singleton datumHash datum}
-  let mkRedeemerWit = do
-        GenEnv {gePParams} <- ask
-        let rPtr = RdmrPtr Spend (fromIntegral txIx)
-        --maxTxExUnit
-        exUnits <- pure $ ExUnits 0 0 --lift arbitrary
-        pure $ mempty {txrdmrs = Redeemers $ Map.singleton rPtr (datum, exUnits)}
-  redeemerWit <- mkRedeemerWit
-  pure $ datumWit <> redeemerWit
+  let rPtr = RdmrPtr Spend (fromIntegral txIx)
+  pure $
+    mempty
+      { txrdmrs = Redeemers $ Map.singleton rPtr (datum, exUnits)
+      , txdats = TxDats $ Map.singleton datumHash datum
+      }
 
 genTxWitness :: TxOut A -> GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
 genTxWitness (TxOut addr _ _) = do
   case addr of
     AddrBootstrap baddr ->
-      error $ "Can't authorize bootstarp address: " ++ show baddr
+      error $ "Can't authorize bootstrap address: " ++ show baddr
     Addr _ payCred stakeCred -> do
       let mkWitVKey ::
             Credential kr C_Crypto ->
@@ -364,21 +381,19 @@ genValidatedTx = do
   -- 2. Check if all Plutus scripts are valid
   let allValid vs = IsValid $ getAll $ mconcat [All v | SJust (IsValid v) <- vs]
       toSpendNoCollateralTxOuts = Map.elems toSpendNoCollateral
-      maxCoin = Coin (toInteger (maxBound :: Int)) -- need it for size overestimation
-  isValid <-
-    allValid
-      <$> mapM
-        getScriptValidity
-        [addr | TxOut addr _ (SJust _) <- toSpendNoCollateralTxOuts]
+      -- We use maxBound to ensure the serializaed size overestimation
+      maxCoin = Coin (toInteger (maxBound :: Int))
+      txAddrsWithDatums = [addr | TxOut addr _ (SJust _) <- toSpendNoCollateralTxOuts]
+  isValid <- allValid <$> mapM getScriptValidity txAddrsWithDatums
   -- 3. Generate all recipients and witnesses needed for spending Plutus scripts
   recipients <- genRecipientsFrom toSpendNoCollateralTxOuts
+  exUnits <- genExUnits (length txAddrsWithDatums)
   redeemerWitsList <-
-    sequence
-      [ genTxPlutusWitness ix dh
-        | (ix, (_, TxOut _ _ mdh)) <-
-            zip [0 ..] (Map.toAscList toSpendNoCollateral),
-          SJust dh <- [mdh]
+    zipWithM (uncurry genTxPlutusWitness)
+      [ (ix, dh)
+        | (ix, (_, TxOut _ _ (SJust dh))) <- zip [0 ..] (Map.toAscList toSpendNoCollateral)
       ]
+      exUnits
   keyWitsMakers <- mapM genTxWitness toSpendNoCollateralTxOuts
   -- 4. Estimate inputs that will be used as collateral
   maxCollateralCount <-
@@ -453,7 +468,6 @@ genValidatedTx = do
 genTxAndUTXOState :: Gen (TRC (AlonzoUTXOW A))
 genTxAndUTXOState = do
   maxTxExUnits <- arbitrary
-  maxBlockExUnits <- arbitrary
   Positive maxCollateralInputs <- arbitrary
   collateralPercentage <- fromIntegral <$> chooseInt (100, 10000)
   minfeeA <- fromIntegral <$> chooseInt (100, 1000)
@@ -471,7 +485,6 @@ genTxAndUTXOState = do
             _maxValSize = 1000,
             _maxTxSize = fromIntegral (maxBound :: Int),
             _maxTxExUnits = maxTxExUnits,
-            _maxBlockExUnits = maxBlockExUnits,
             _collateralPercentage = collateralPercentage,
             _maxCollateralInputs = maxCollateralInputs
           }
@@ -490,7 +503,7 @@ totalAda :: UTxOState A -> Coin
 totalAda (UTxOState utxo f d _) = f <> d <> coin (balance utxo)
 
 testTxValidForUTXOW :: TRC (AlonzoUTXOW A) -> Property
-testTxValidForUTXOW trc@(TRC (UtxoEnv _ pp _ _, utxoState, vtx)) =
+testTxValidForUTXOW trc@(TRC (UtxoEnv _ _pp _ _, utxoState, _vtx)) =
   case runShelleyBase $ applySTSTest trc of
     Right utxoState' -> totalAda utxoState' === totalAda utxoState
     Left e -> counterexample (show e) (property False)
