@@ -45,6 +45,7 @@ library
   exposed-modules:
     Test.Cardano.Crypto.VRF.Fake
     Test.Shelley.Spec.Ledger.BenchmarkFunctions
+    Test.Shelley.Spec.Ledger.BeTreeTest
     Test.Shelley.Spec.Ledger.ConcreteCryptoTypes
     Test.Shelley.Spec.Ledger.Examples.Cast
     Test.Shelley.Spec.Ledger.Examples.Consensus

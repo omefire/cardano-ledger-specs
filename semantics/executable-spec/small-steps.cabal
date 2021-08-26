@@ -49,6 +49,7 @@ library
                      , Data.MemoBytes
                      , Data.Coders
                      , Data.Pulse
+		     , Data.BeTree
                      , Control.Provenance
                      , Control.Iterate.SetAlgebra
                      , Control.Iterate.Collect
