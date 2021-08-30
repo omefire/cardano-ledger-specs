@@ -61,8 +61,8 @@ splitMap m = (k1, m1, k2, m2)
 -- An Internal node has 2 maps. The first represents the Internal nodes subtree descendants.
 -- And the second represents messages that will be "flushed" to one or more of those subtrees.
 -- Suppose the subtrees look like [(3,d1),(9,d2),(12,d3),(20,d4)] where d1,d2,d3,d4 are
--- the descendants, 3,9,12,20 are keys that determine the key-range stored in the associated decendants.
--- The question arises which messages go to each of these descendants.
+-- the descendant subtrees, 3,9,12,20 are keys that determine the key-range stored in the
+-- associated decendants. The question arises which messages go to each of these descendants.
 -- keys such that (      key <  9) go to d1
 --                (9  <= key < 12) go to d2
 --                (12 <= key < 20) go to d3
@@ -89,9 +89,9 @@ newkey (First lo _) m =
 newkey (Middle lo _) _ = lo
 newkey (Last lo) _ = lo
 
--- ===========================================================
--- BeTrees have two parts, whose size is related by epsilon
-{- ===========================================================
+-- =============================================================
+-- BeTree nodes have two parts, whose size is related by epsilon
+{- =============================================================
 
 |------subtrees------------|---messagebuffer---|
 |------------------Internal--------------------|
@@ -153,14 +153,16 @@ findB key subtrees =
 -- ==========================================================
 -- helper functions that do the hard work.
 
--- | Never build an Internal Node with one subtree and no messages
+-- | Never build an Internal Node with one or zero subtrees and no messages
 internalOpt :: Map.Map k (BeTree k v) -> Map.Map k (Message v) -> BeTree k v
 internalOpt subtrees buffer
   | Map.null subtrees && Map.null buffer = Leaf Map.empty
   | Map.size subtrees == 1 && Map.null buffer = snd (Map.findMin subtrees)
   | True = Internal subtrees buffer
 
--- | Applying some messages to a BeTree may cause a Split, if there is no room for all the messages.
+-- | Applying some messages to a BeTree may cause 
+--   1) a flush if the message buffer becomes over full
+--   2) a split, if there is no room for all the applied values.
 applyFlushSplit :: Ord k => BeTree k v -> Map.Map k (Message v) -> Split k (BeTree k v)
 applyFlushSplit (Leaf m1) m2
   | newsize <= nodesize = One (Leaf new)
@@ -192,7 +194,7 @@ applyFlushSplit (Internal subtrees buffer) m2
 -- ===================================================================
 -- Choosing where to flush some messages
 
--- | Collect the range intervals of the descendant map.
+-- | Collect the range intervals of the subtree descendant map.
 --   for example if: m1 = Map.fromList [(3,"one"),(9,"two"),(12,"three"),(20,"four")]
 --   ranges m1 == [(First 3 9,"one"),(Middle 9 12,"two"),(Middle 12 20,"three"),(Last 20,"four")]
 ranges :: Map.Map k a -> [(Interval k, a)]
@@ -207,7 +209,7 @@ ranges m1 = fixFirst (collectTriples (Map.toAscList m1))
     fixFirst ((Middle l h, a) : more) = (First l h, a) : more
     fixFirst xs = xs
 
--- | Given an interval get all entries from 'ms' in that interval.
+-- | Given an interval, compute a subset of all entries from 'ms' in that interval.
 --   The interval is closed on the low side (i.e. includes low), and open
 --   on the high side (does not include high). If (First lo hi) think
 --   of 'lo' as negative infinity, and if (Last lo hi)  think of 'hi' as infinity.
@@ -273,7 +275,7 @@ mapToBeTree :: Ord k => Map.Map k v -> BeTree k v
 mapToBeTree m = fromList (Map.assocs m) (Leaf Map.empty)
 
 -- ==============================================
--- Instances, Show for BeTree and Monoid for Message
+-- Instance Monoid for Message
 
 instance Semigroup (Message v) where
   (<>) = merge
