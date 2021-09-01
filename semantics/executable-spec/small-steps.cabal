@@ -48,7 +48,9 @@ library
                      , Data.CanonicalMaps
                      , Data.MemoBytes
                      , Data.Coders
+		     , Data.DeltaState
                      , Data.Pulse
+		     , Data.Messages
 		     , Data.BeTree
                      , Control.Provenance
                      , Control.Iterate.SetAlgebra
@@ -63,6 +65,7 @@ library
                      , cryptonite
                      , data-default-class
                      , deepseq
+		     , fingertree
                      , formatting
                      , free
                      , mtl

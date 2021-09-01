@@ -1,7 +1,8 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | Implements a prototype B-epsilon tree. It is virtual in that nodes
 --   are not stored on disk, but in main memory. It exhibits the correct
@@ -11,55 +12,8 @@ module Data.BeTree where
 
 import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
+import Data.Messages
 import Data.Ratio ((%))
-import Data.FingerTree hiding (fromList)
-import qualified Data.FingerTree as FT
-import Debug.Trace
-
--- ===================================================================
-
-data Function v = Identity | Plus v | Compose (Function v) (Function v)
-  deriving Show
-
-class Exp t where
-  plus:: t -> t -> t
-
-applyExp :: Exp v => Function v -> v -> v
-applyExp Identity x = x
-applyExp (Plus n) x = plus n x
-applyExp (Compose f g) x = applyExp f (applyExp g x)
-
-data Message v
-  = Edit v -- Change the value to v, if it is there, otherwise insert v if it is not
-  | Delete
-  | Upsert (Function v)
-
--- Composition, apply the operator on the right first
-merge :: Exp v => Message v -> Message v -> Message v
-merge Delete _ = Delete
-merge (Edit x) Delete = Edit x
-merge (Edit x) (Edit _) = Edit x
-merge (Edit x) (Upsert _) = Edit x
-
-merge (Upsert Identity) (Edit x) = Edit x
-merge (Upsert Identity) Delete = Delete
-merge (Upsert Identity) (Upsert exp) = Upsert exp
-
-merge (Upsert (Plus v)) (Edit x) = Edit (plus v x)
-merge (Upsert (Plus v)) Delete = Delete
-merge (Upsert (Plus v)) (Upsert exp) = Upsert (Compose (Plus v) exp)
-merge (Upsert (Compose f g)) x = merge (Upsert f) (merge (Upsert g) x)
-
-newtype Delta k v = Delta (Map.Map k (Message v))
-  deriving Show
-
-applyMessages :: (Ord k,Exp v) => Map.Map k v -> Delta k v -> Map.Map k v
-applyMessages m (Delta messages) = Map.foldlWithKey' acc m messages
-  where
-    acc ans key Delete = Map.delete key ans
-    acc ans key (Edit v) = Map.insert key v ans
-    acc ans key (Upsert Identity) = ans
-    acc ans key (Upsert (Plus n)) = Map.update (\ x -> Just(plus n x)) key ans
 
 -- ========================================
 
@@ -151,13 +105,13 @@ isempty :: BeTree k v -> Bool
 isempty (Leaf dats) = Map.null dats
 isempty (Internal m1 (Delta m2)) = Map.null m1 && Map.null m2
 
-insertB :: (Exp v,Ord k) => k -> v -> BeTree k v -> BeTree k v
+insertB :: (Exp v, Ord k) => k -> v -> BeTree k v -> BeTree k v
 insertB k v tree =
   case applyFlushSplit tree (Delta (Map.singleton k (Edit v))) of
     One x -> x
     Two (k1, t1) (k2, t2) -> internalOpt (Map.fromList [(k1, t1), (k2, t2)]) (Delta Map.empty)
 
-lookupB :: (Exp v,Ord k) => k -> BeTree k v -> Maybe v
+lookupB :: (Exp v, Ord k) => k -> BeTree k v -> Maybe v
 lookupB key (Leaf x) = Map.lookup key x
 lookupB key (Internal subtrees (Delta buffer)) =
   case Map.lookup key buffer of
@@ -166,7 +120,7 @@ lookupB key (Internal subtrees (Delta buffer)) =
     Just (Upsert f) -> applyExp f <$> (findB key subtrees)
     Nothing -> (findB key subtrees)
 
-findB :: (Exp v,Ord k) => k -> Map.Map k (BeTree k v) -> Maybe v
+findB :: (Exp v, Ord k) => k -> Map.Map k (BeTree k v) -> Maybe v
 findB key subtrees =
   case Map.splitLookup key subtrees of
     (_, Just tree, _) -> lookupB key tree
@@ -185,10 +139,10 @@ internalOpt subtrees (Delta buffer)
   | Map.size subtrees == 1 && Map.null buffer = snd (Map.findMin subtrees)
   | True = Internal subtrees (Delta buffer)
 
--- | Applying some messages to a BeTree may cause 
+-- | Applying some messages to a BeTree may cause
 --   1) a flush if the message buffer becomes over full
 --   2) a split, if there is no room for all the applied values.
-applyFlushSplit :: (Exp v,Ord k) => BeTree k v -> Delta k v -> Split k (BeTree k v)
+applyFlushSplit :: (Exp v, Ord k) => BeTree k v -> Delta k v -> Split k (BeTree k v)
 applyFlushSplit (Leaf m1) (Delta m2)
   | newsize <= nodesize = One (Leaf new)
   | True =
@@ -203,7 +157,7 @@ applyFlushSplit (Internal subtrees (Delta buffer)) (Delta m2)
   -- The trialSubtrees is small enough so we don't have to split
   | Map.size trialSubtrees <= subtreesize = One (internalOpt trialSubtrees (Delta (newbuffer)))
   -- We have to spit the Internal node into 2 Internal nodes.
-  | True = Two (k1, internalOpt subtrees1(Delta buffer1)) (k2, internalOpt subtrees2 (Delta buffer2))
+  | True = Two (k1, internalOpt subtrees1 (Delta buffer1)) (k2, internalOpt subtrees2 (Delta buffer2))
   where
     new = Map.unionWith merge m2 buffer
     newsize = Map.size new
@@ -285,7 +239,7 @@ chooseFlush descMap messageMap = best
 -- ================================================================
 -- Converting between [(k,v)], (Map.Map k v), and (BeTree k v)
 
-fromList :: (Exp v,Ord k) => [(k, v)] -> BeTree k v -> BeTree k v
+fromList :: (Exp v, Ord k) => [(k, v)] -> BeTree k v -> BeTree k v
 fromList [] ans = ans
 fromList ((k, v) : more) ans = fromList more (insertB k v ans)
 
@@ -296,93 +250,5 @@ beTreeToMap (Internal subtrees messages) =
     (Map.unions (Map.elems (Map.map beTreeToMap subtrees)))
     messages
 
-mapToBeTree :: (Exp v,Ord k) => Map.Map k v -> BeTree k v
+mapToBeTree :: (Exp v, Ord k) => Map.Map k v -> BeTree k v
 mapToBeTree m = fromList (Map.assocs m) (Leaf Map.empty)
-
--- ==============================================
--- Instance Monoid for Message and Delta
-
-instance Exp v => Semigroup (Message v) where
-  (<>) = merge
-
-instance Exp v => Monoid (Message v) where
-  mempty = Upsert Identity
-  mappend = (<>)
-
-
-instance Show v => Show(Message v) where
-  show (Edit n) = "(Edit "++show n++")"
-  show Delete = "Delete"
-  show (Upsert x) = "(Upsert "++show x++")"
-
-instance (Ord k,Exp v) => Semigroup (Delta k v) where
- (<>) (Delta x) (Delta y) = Delta (Map.unionWith merge x y)
-
-instance (Ord k,Exp v) => Monoid (Delta k v) where
-  mempty = Delta (Map.empty)
-
--- ==========================================
--- Finger Trees and sequences with partial sums
-
--- | A Partial is Monoid made from a Pair of Monoids,
---  the first part of the Pair (the sum for) Int,
---  the second part is Accumulated Delta appications 
-data Partial k v = Partial Int (Delta k v)
-  deriving Show
-
-
-instance (Ord k,Exp v) => Semigroup (Partial k v) where
-  (<>) (Partial n x) (Partial m y) = Partial (n + m) (x <> y)
-
-instance (Ord k,Exp v) => Monoid (Partial k v) where
-  mempty = Partial 0 mempty
-
-
-
-instance (Ord k,Exp v) => Measured (Partial k v) (Delta k v) where
-  measure m = (Partial 1 m)
-
-
-
-one (k,t) = Delta (Map.singleton k t)
-
-actions :: [Delta Char Int]
-actions = [one('a',Upsert (Plus 2)),one('b',Edit 3), one('b',Delete),one('a',Edit 2)]
-
-
-
-timeline :: FingerTree (Partial Char Int) (Delta Char Int)
-timeline = FT.fromList actions
-
-
-ss :: (Ord k,Show k,Exp v,Show v) => FingerTree (Partial k v) (Delta k v) -> IO ()
-ss x = case viewl x of
-        EmptyL -> pure ()
-        (a :< xs) ->
-          case measure x of
-            Partial index acc ->
-              putStrLn ("element = "++show a++", cummulative action = "++show acc++", index = "++show index) >> ss xs
-
-disp xs = putStrLn "" >> (ss xs)
-
-
--- the computed index "flows" from right to left, because the element at the end of the sequence was added first
--- For example, the sequence of Messages  [Upsert (+2),Edit 3,Delete,Edit 2], has this internal shape, where
--- the first line is the left most element of the sequence.
--- element = Upsert, cummulative action = (Edit 5), index = 4
--- element = (Edit 3), cummulative action = (Edit 3), index = 3
--- element = Delete, cummulative action = Delete, index = 2
--- element = (Edit 2), cummulative action = (Edit 2), index = 1
-
-
-hasindex i (Partial n _) (Partial m _) = n>i 
-
-
--- | Update a particular index with 'message' at key 'k, the cumulative actions are recomputed in log time.
-update :: (Ord k,Exp v) => Int -> k -> Message v -> FingerTree (Partial k v) (Delta k v) ->  FingerTree (Partial k v) (Delta k v)
-update i k message timeline =
-  case search (hasindex i) timeline of
-    Position left (Delta old) right -> left >< (Delta(Map.insertWith merge k message old) <| right )
-
-
-instance Exp Int where plus x y = x+y
