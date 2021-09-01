@@ -37,9 +37,14 @@ instance (Ord k, Exp v) => Measured (Partial k v) (Delta k v) where
 
 -- | State has ondisk and inmemory parts.
 data State k v = State
-  { onDisk :: Map.Map k v,
+  { -- | The ondisk component. Stays constant
+    onDisk :: Map.Map k v,
+    -- | Subset of onDisk, just the keys needed for the computation when we begin
     initInMemory :: Map.Map k v,
+    -- | Updated initInMemory as changes are made.
     activeInMemory :: Map.Map k v,
+    -- | A sequence of changes (Delta k v), one for each block. The sequence is Measured by Partial
+    --   which as a monoid accumulates all the partial changes as the sequence grows.
     blocks :: FingerTree (Partial k v) (Delta k v)
   }
 
