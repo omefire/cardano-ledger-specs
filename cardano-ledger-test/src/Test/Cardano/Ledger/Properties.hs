@@ -9,9 +9,6 @@
 
 module Test.Cardano.Ledger.Properties where
 
-import GHC.Records
-import Data.Functor
-import Data.Bifunctor (first)
 import Cardano.Ledger.Alonzo (AlonzoEra, Value)
 import Cardano.Ledger.Alonzo.Data (Data, DataHash, hashData)
 import Cardano.Ledger.Alonzo.Language (Language (..))
@@ -26,7 +23,7 @@ import Cardano.Ledger.Alonzo.Tx
   )
 import Cardano.Ledger.Alonzo.TxBody (TxBody (..), TxOut (..))
 import Cardano.Ledger.Alonzo.TxWitness (RdmrPtr (..), Redeemers (..), TxDats (..), TxWitness (..))
-import Cardano.Ledger.BaseTypes (Network (Testnet), StrictMaybe (..))
+import Cardano.Ledger.BaseTypes (Network (Testnet), StrictMaybe (..), strictMaybeToMaybe)
 import Cardano.Ledger.Coin (Coin (..))
 import Cardano.Ledger.Hashes (EraIndependentTxBody, ScriptHash (..))
 import Cardano.Ledger.Keys
@@ -41,17 +38,19 @@ import Cardano.Ledger.SafeHash (SafeHash, hashAnnotated)
 import Cardano.Ledger.ShelleyMA.Timelocks (Timelock (..), ValidityInterval (..))
 import Cardano.Ledger.Val
 import Cardano.Slotting.Slot (SlotNo (..))
-import Control.Monad (forM, join, replicateM, zipWithM)
+import Control.Monad (forM, join, replicateM)
 import Control.Monad.State.Strict (MonadState (..), modify)
 import Control.Monad.Trans.Class (MonadTrans (lift))
 import Control.Monad.Trans.RWS.Strict (RWST (..), ask, evalRWST)
 import Control.State.Transition.Extended hiding (Assertion)
+import Data.Bifunctor (first)
 import Data.Coerce
 import Data.Default.Class (Default (def))
 import qualified Data.Foldable as F
+import Data.Functor
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromJust, catMaybes)
+import Data.Maybe (catMaybes, fromJust)
 import Data.Monoid (All (..))
 import Data.Ratio ((%))
 import qualified Data.Sequence.Strict as Seq
@@ -104,8 +103,8 @@ data GenEnv = GenEnv
 
 data GenState = GenState
   { gsKeys :: Map (KeyHash 'Witness C_Crypto) (KeyPair 'Witness C_Crypto),
-    gsScripts :: Map (ScriptHash C_Crypto) (StrictMaybe (DataHash C_Crypto, IsValid), Script A),
-    gsDatums :: Map (DataHash C_Crypto) (Tag, Data A)
+    gsScripts :: Map (ScriptHash C_Crypto) (StrictMaybe (Tag, IsValid), Script A),
+    gsDatums :: Map (DataHash C_Crypto) (Data A)
   }
 
 instance Semigroup GenState where
@@ -140,7 +139,6 @@ genExUnits n = do
       | maxVal == 0 = pure $ replicate n 0
       | otherwise = snd <$> F.foldlM (genUpTo maxVal) (maxVal, []) [1 .. n]
 
-
 -- genTxPlutusWitness :: ExUnits -> Int -> DataHash C_Crypto -> GenRS (TxWitness A)
 -- genTxPlutusWitness txIx datumHash exUnits = do
 --   (tag, datum) <- lookupByHashM "datum" datumHash gsDatums
@@ -155,20 +153,21 @@ genExUnits n = do
 -- credentials. Because of the latter produced function requires a body hash for
 -- an acutal witness to be constructed.
 genTimelockKeyWitness ::
-     TxOut A -> GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
+  TxOut A -> GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
 genTimelockKeyWitness (TxOut addr _ _) = do
   case addr of
     AddrBootstrap baddr ->
       error $ "Can't authorize bootstrap address: " ++ show baddr
     Addr _ payCred stakeCred -> do
       let mkWitVKey ::
-               Credential kr C_Crypto
-            -> GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
+            Credential kr C_Crypto ->
+            GenRS (SafeHash C_Crypto EraIndependentTxBody -> TxWitness A)
           mkWitVKey (KeyHashObj keyHash) = do
             cred <- lookupByHashM "credential" (coerceKeyRole keyHash) gsKeys
             pure $ \bodyHash ->
               mempty
-                {txwitsVKey = Set.singleton $ makeWitnessVKey bodyHash cred}
+                { txwitsVKey = Set.singleton $ makeWitnessVKey bodyHash cred
+                }
           mkWitVKey (ScriptHashObj scriptHash) = do
             s@(mDatumHash, script) <-
               lookupByHashM "script" scriptHash gsScripts
@@ -258,8 +257,7 @@ genScript tag =
       let script
             | isValid = alwaysSucceeds 3
             | otherwise = alwaysFails 3
-      datumHash <- genDatumHash tag
-      pure (SJust (datumHash, IsValid isValid), script)
+      pure (SJust (tag, IsValid isValid), script)
     toScriptHash s@(_, script) = do
       let scriptHash = hashScript @A script
       modify $ \ts@GenState {gsScripts} -> ts {gsScripts = Map.insert scriptHash s gsScripts}
@@ -270,11 +268,6 @@ lookupScriptValidity (Addr _ (ScriptHashObj scriptHash) _) =
   fmap snd . fst <$> lookupByHashM "script" scriptHash gsScripts
 lookupScriptValidity _ = pure SNothing
 
-lookupScriptDatumHash :: MonadState GenState m => Addr C_Crypto -> m (StrictMaybe (DataHash C_Crypto))
-lookupScriptDatumHash (Addr _ (ScriptHashObj scriptHash) _) =
-  fmap fst . fst <$> lookupByHashM "script" scriptHash gsScripts
-lookupScriptDatumHash _ = pure SNothing
-
 paymentCredAddr :: Addr C_Crypto -> Maybe (Credential 'Payment C_Crypto)
 paymentCredAddr (Addr _ cred _) = Just cred
 paymentCredAddr _ = Nothing
@@ -284,57 +277,38 @@ stakeCredAddr (Addr _ _ (StakeRefBase cred)) = Just cred
 stakeCredAddr _ = Nothing
 
 lookupPlutusScript ::
-     MonadState GenState m
-  => Credential k C_Crypto
-  -> m (Maybe (DataHash C_Crypto, IsValid))
+  MonadState GenState m =>
+  Credential k C_Crypto ->
+  m (Maybe (Tag, IsValid))
 lookupPlutusScript (KeyHashObj _) = pure Nothing
 lookupPlutusScript (ScriptHashObj scriptHash) =
   lookupByHashM "script" scriptHash gsScripts <&> \case
-    (SJust (datumHash, isValid), _) -> Just (datumHash, isValid)
+    (SJust (tag, isValid), _) -> Just (tag, isValid)
     _ -> Nothing
 
-
 plutusWitnessMaker ::
-     MonadState GenState m
-  => [Maybe (Credential k C_Crypto)]
-  -> m (IsValid, [ExUnits -> TxWitness A])
+  [Maybe (GenRS (DataHash C_Crypto, Data A), Credential k C_Crypto)] ->
+  GenRS (IsValid, [ExUnits -> TxWitness A])
 plutusWitnessMaker listWithCred =
   let creds =
-        [ (ix, cred)
-        | (ix, mCred) <- zip [0 ..] listWithCred
-        , Just cred <- [mCred]
+        [ (ix, genDat, cred)
+          | (ix, mCred) <- zip [0 ..] listWithCred,
+            Just (genDat, cred) <- [mCred]
         ]
       allValid = IsValid . getAll . foldMap (\(IsValid v) -> All v)
    in fmap (first allValid . unzip . catMaybes) $
-      forM creds $ \(ix, cred) ->
-        lookupPlutusScript cred >>= \case
-          Nothing -> pure Nothing
-          Just (datumHash, isValid) -> do
-            (tag, datum) <- lookupByHashM "datum" datumHash gsDatums
-            let rPtr = RdmrPtr tag ix
-                mkWit exUnits =
-                   mempty
-                     { txrdmrs = Redeemers $ Map.singleton rPtr (datum, exUnits)
-                     , txdats = TxDats $ Map.singleton datumHash datum
-                     }
-            pure $ Just (isValid, mkWit)
-
-
--- extractPlutusScriptsFromTxOut ::
---      MonadState GenState m => Int -> TxOut A -> m [(Int, DataHash C_Crypto, IsValid)]
--- extractPlutusScriptsFromTxOut _ (TxOut AddrBootstrap {} _ _) = pure []
--- extractPlutusScriptsFromTxOut txIx (TxOut (Addr _ payCred stakeRef) _ _) = do
---   stakeScript <-
---     case stakeRef of
---       StakeRefBase stakeCred -> countPlutusScript stakeCred
---       _ -> pure 0
---   payScriptCount <- countPlutusScript payCred
---   pure $ payScriptCount + stakeScriptCount
---   where
---     countPlutusScript _ = pure 0
---     countScript  0
---     countScript  = do
-
+        forM creds $ \(ix, genDat, cred) ->
+          lookupPlutusScript cred >>= \case
+            Nothing -> pure Nothing
+            Just (tag, isValid) -> do
+              (datumHash, datum) <- genDat
+              let rPtr = RdmrPtr tag ix
+                  mkWit exUnits =
+                    mempty
+                      { txrdmrs = Redeemers $ Map.singleton rPtr (datum, exUnits),
+                        txdats = TxDats $ Map.singleton datumHash datum
+                      }
+              pure $ Just (isValid, mkWit)
 
 genNoScriptRecipient :: GenRS (Addr C_Crypto)
 genNoScriptRecipient = do
@@ -353,23 +327,27 @@ genRecipient :: GenRS (Addr C_Crypto)
 genRecipient = do
   paymentCred <- genCredential Spend
   stakeCred <- coerceKeyRole . KeyHashObj <$> genKeyHash
-  --stakeCred <- genCredential Spend
+  --stakeCred <- genCredential Rewrd
   pure (Addr Testnet paymentCred (StakeRefBase stakeCred))
 
-genDatumHash :: Tag -> GenRS (DataHash C_Crypto)
-genDatumHash = fmap fst . genDatum
+genDatumHash :: GenRS (DataHash C_Crypto)
+genDatumHash = fst <$> genDatum
 
-genDatum :: Tag -> GenRS (DataHash C_Crypto, Data A)
-genDatum tag = do
+genDatum :: GenRS (DataHash C_Crypto, Data A)
+genDatum = do
   datum <- lift arbitrary
   let datumHash = hashData datum
-  modify $ \ts@GenState {gsDatums} -> ts {gsDatums = Map.insert datumHash (tag, datum) gsDatums}
+  modify $ \ts@GenState {gsDatums} -> ts {gsDatums = Map.insert datumHash datum gsDatums}
   pure (datumHash, datum)
 
 genTxOut :: Value A -> GenRS (TxOut A)
 genTxOut val = do
   addr <- genRecipient --frequencyT [(80, genRecipient), (20, pickExistingRecipient)]
-  mDatumHash <- lookupScriptDatumHash addr
+  cred <- maybe (error "BootstrapAddress encountered") pure $ paymentCredAddr addr
+  mDatumHash <-
+    lookupPlutusScript cred >>= \case
+      Nothing -> pure SNothing
+      Just _ -> SJust <$> genDatumHash
   pure $ TxOut addr val mDatumHash
 
 -- | Generate a non-zero value
@@ -428,8 +406,6 @@ genUTxOState :: UTxO A -> GenRS (UTxOState A)
 genUTxOState utxo =
   lift (UTxOState utxo <$> arbitrary <*> arbitrary <*> pure def)
 
-
-
 genRecipientsFrom :: [TxOut A] -> GenRS [TxOut A]
 genRecipientsFrom txOuts = do
   let outCount = length txOuts
@@ -470,29 +446,21 @@ genValidatedTx = do
       maxCoin = Coin (toInteger (maxBound :: Int))
   -- 3. Generate all recipients and witnesses needed for spending Plutus scripts
   recipients <- genRecipientsFrom toSpendNoCollateralTxOuts
-  let toSpendAddresses = map (getField @"address" . snd) $ Map.toAscList toSpendNoCollateral
-
-  (IsValid v1, mkPaymentWits) <- plutusWitnessMaker $ map paymentCredAddr toSpendAddresses
-  (IsValid v2, mkStakingWits) <- plutusWitnessMaker $ map stakeCredAddr toSpendAddresses
+  (IsValid v1, mkPaymentWits) <-
+    plutusWitnessMaker
+      [ (\dh c -> ((,) dh <$> lookupByHashM "datum" dh gsDatums, c))
+          <$> strictMaybeToMaybe mDatumHash <*> paymentCredAddr addr
+        | (_, TxOut addr _ mDatumHash) <- Map.toAscList toSpendNoCollateral
+      ]
+  (IsValid v2, mkStakingWits) <-
+    plutusWitnessMaker
+      [ (,) genDatum <$> stakeCredAddr addr
+        | (_, TxOut addr _ _) <- Map.toAscList toSpendNoCollateral
+      ]
   let isValid = IsValid (v1 && v2)
   exUnits <- genExUnits (length mkPaymentWits + length mkStakingWits)
   let redeemerWitsList = zipWith ($) (mkPaymentWits ++ mkStakingWits) exUnits
-  -- paymentPlutusScriptsData <- map paymentCredAddr toSpendAddresses
-  --   zipWithM extractPlutusScriptsFromTxOut $ [0.. ] $ 
 
-  -- -- Find the total number of all plutus scripts in the transaction
-  -- exUnits <- genExUnits numPlutusScripts
-
-  -- redeemerWitsList <-
-  --   zipWithM
-  --     (uncurry genTxPlutusWitness)
-  --     [ (ix, dh)
-  --       | (ix, (_, TxOut _ _ (SJust dh))) <- zip [0 ..] (Map.toAscList toSpendNoCollateral)
-  --     ]
-  --     exUnits
-
-  -- plutusSpendWitsList <-
-  --   zipWithM (genTxPlutusWitness exUnits) [0 ..] $ map snd $ Map.toAscList toSpendNoCollateral
   keyWitsMakers <- mapM genTimelockKeyWitness toSpendNoCollateralTxOuts
   -- 4. Estimate inputs that will be used as collateral
   maxCollateralCount <-
@@ -523,9 +491,9 @@ genValidatedTx = do
         TxBody
           { inputs = Map.keysSet toSpendNoCollateral,
             collateral = bogusCollateralTxIns,
-            outputs = Seq.fromList recipients,  -- has scripts
-            txcerts = mempty,  -- has scripts
-            txwdrls = Wdrl mempty,  -- has scripts
+            outputs = Seq.fromList recipients, -- has scripts
+            txcerts = mempty, -- has scripts
+            txwdrls = Wdrl mempty, -- has scripts
             txfee = maxCoin,
             txvldt = geValidityInterval,
             txUpdates = SNothing,
