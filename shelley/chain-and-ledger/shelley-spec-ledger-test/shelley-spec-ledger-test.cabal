@@ -45,8 +45,9 @@ library
   exposed-modules:
     Test.Cardano.Crypto.VRF.Fake
     Test.Shelley.Spec.Ledger.BenchmarkFunctions
-    Test.Shelley.Spec.Ledger.BeTreeTest
+    Test.Shelley.Spec.Ledger.BeTreeTests
     Test.Shelley.Spec.Ledger.ConcreteCryptoTypes
+    Test.Shelley.Spec.Ledger.CompactMap
     Test.Shelley.Spec.Ledger.Examples.Cast
     Test.Shelley.Spec.Ledger.Examples.Consensus
     Test.Shelley.Spec.Ledger.Generator.Block
@@ -111,6 +112,7 @@ library
     nothunks,
     process-extras,
     plutus-ledger-api,
+    prettyprinter,
     QuickCheck >= 2.13.2,
     serialise,
     shelley-spec-ledger,

@@ -51,15 +51,24 @@ data State k v = State
 -- | Set up an initial State by preloading a subset of the 'keys' from 'ondisk'
 initialState :: (Ord k, Exp v) => Map.Map k v -> Set.Set k -> State k v
 initialState ondisk keys = State ondisk memory memory FT.empty
-  where
-    memory = Set.foldl' accum Map.empty keys
-    accum ans key = case Map.lookup key ondisk of
-      Nothing -> ans
-      Just v -> Map.insert key v ans
+  where memory = Set.foldl' accum Map.empty keys
+        accum ans key = case Map.lookup key ondisk of
+          Nothing -> ans
+          Just v -> Map.insert key v ans
 
--- | Applies the 'blockfun' to the subset of the 'disk' state stored in 'memory' to compute
---   a set of changes 'delta', updates the state stored in 'memory' and adds the 'delta'
---   to the trace, which extends the memoized sequence of accumulating deltas.
+-- | Updates the 'readset' (a subset of the 'disk' state) from the 'time' it was read to the current time.
+--   Applies the 'blockfun' to  to compute a set of changes 'delta', updates the state stored in 'memory'
+--   and adds the 'delta' to the trace, which extends the memoized sequence of accumulating deltas.
+applyBlock2 :: (Exp v, Ord k) => (Map.Map k v -> Delta k v) -> Map.Map k v -> Int -> State k v -> State k v
+applyBlock2 blockfun readset time (State disk _ _ trace) = State disk initial memory2 trace2
+  where
+    (Partial _ activedelta) = since time trace
+    initial = applyMessages readset activedelta
+    delta = blockfun initial
+    memory2 = applyMessages initial delta
+    trace2 = delta <| trace
+
+
 applyBlock :: (Exp v, Ord k) => (Map.Map k v -> Delta k v) -> State k v -> State k v
 applyBlock blockfun (State disk initial memory trace) = State disk initial memory2 trace2
   where
@@ -102,6 +111,9 @@ actions =
 timeline :: FingerTree (Partial Char Int) (Delta Char Int)
 timeline = FT.fromList actions
 
+ts ::FingerTree (Partial Char Int) (Delta Char Int)
+ts = timeline
+
 ss :: (Ord k, Show k, Exp v, Show v) => FingerTree (Partial k v) (Delta k v) -> IO ()
 ss x = case viewl x of
   EmptyL -> pure ()
@@ -130,3 +142,15 @@ update i k message trace =
   case search (hasindex i) trace of
     Position left (Delta old) right -> left >< (Delta (Map.insertWith merge k message old) <| right)
     _other -> trace
+
+-- | The cumulative set of changes from 'time' to the current time. The idea is that the active set was read
+--   at 'time' and we need to apply the changes after 'time' to bring it upto date. The trace may encode
+--   many previous changes as well, but since the active set was read at 'time' it already includes
+--   the change at 'time' and also earlier changes.  Depending on how you count, this may be off by one!!!!!
+since:: (Exp v, Ord k) =>
+        Int -> FingerTree (Partial k v) (Delta k v) -> (Partial k v)
+since time trace =
+  case search (\ (Partial n _) (Partial m _) -> m<(time - 1)) trace of
+    Position left _ _ -> (measure left)
+    other -> (measure trace)
+

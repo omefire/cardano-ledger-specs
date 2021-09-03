@@ -1,27 +1,25 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
-module Test.Shelley.Spec.Ledger.BeTreeTest where
+module Test.Shelley.Spec.Ledger.BeTreeTests where
 
 import Cardano.Ledger.Pretty (PDoc, ppMap', ppRecord, ppSexp, ppString)
+import Data.Messages
 import Data.BeTree
 import qualified Data.Map as Map
 import Prettyprinter (viaShow)
 import Test.Tasty
-import Test.Tasty.QuickCheck (Arbitrary (..), Gen, generate, testProperty, withMaxSuccess, (===))
+import Test.Tasty.QuickCheck (Arbitrary (..), generate, testProperty, withMaxSuccess)
 
-instance Show v => Show (Message v) where
-  show (Edit x) = "(Edit " ++ show x ++ ")"
-  show Delete = "Delete"
-  show (Upsert f) = "Upsert"
 
 ppMessage :: Show v => Message v -> PDoc
 ppMessage (Edit x) = ppSexp "Edit" [viaShow x]
 ppMessage Delete = ppString "Delete"
-ppMessage (Upsert x) = ppString "Upsert"
+ppMessage (Upsert x) = ppSexp "Upsert" [viaShow x]
 
 ppBe :: (Show k, Show v) => BeTree k v -> PDoc
 ppBe (Leaf x) = ppSexp "Leaf" [ppMap' mempty viaShow viaShow x]
-ppBe (Internal sub buffer) =
+ppBe (Internal sub (Delta buffer)) =
   ppRecord
     "Internal"
     [ ("subtrees", ppMap' mempty viaShow ppBe sub),
@@ -44,6 +42,7 @@ converts x = beTreeToMap (mapToBeTree x) == x
 lookups :: Int -> Map.Map Int Int -> Bool
 lookups k x = lookupB k (mapToBeTree x) == Map.lookup k x
 
+main :: IO ()
 main =
   defaultMain $
     testGroup

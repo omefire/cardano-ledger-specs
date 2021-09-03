@@ -48,6 +48,7 @@ library
                      , Data.CanonicalMaps
                      , Data.MemoBytes
                      , Data.Coders
+		     , Data.CompactMap
 		     , Data.DeltaState
                      , Data.Pulse
 		     , Data.Messages
@@ -60,6 +61,7 @@ library
                      , ansi-wl-pprint
                      , base >=4.11 && <5
                      , bytestring
+		     , cardano-binary
                      , cborg
                      , containers
                      , cryptonite
