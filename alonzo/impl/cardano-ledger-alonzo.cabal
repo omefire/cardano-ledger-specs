@@ -65,7 +65,7 @@ library
     containers,
     data-default,
     deepseq,
-    measures,
+    measure,
     mtl,
     nothunks,
     plutus-ledger-api,
